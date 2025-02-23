@@ -1,0 +1,25 @@
+// För alla projekt (inklusive underprojekt)
+allprojects {
+    repositories {
+        google()        // Repositorium för Google-bibliotek
+        mavenCentral()  // Repositorium för Maven-bibliotek
+    }
+}
+
+// Sätter en gemensam build directory för alla projekt
+rootProject.buildDir = "../build"
+
+// För alla underprojekt (subprojects)
+subprojects {
+    // Definierar byggmappen för varje modul
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+    
+    // Sätter att alla subprojects ska vänta på att :app-modulen är utvärderad innan de byggs
+    // project.evaluationDependsOn(":app")
+}
+
+// Registrerar en 'clean'-task som raderar byggmappen
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}
+
