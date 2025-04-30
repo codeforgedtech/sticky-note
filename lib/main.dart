@@ -2,10 +2,49 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'package:sticky_notes/supabase_config.dart';
 import 'settings_page.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:intl/intl.dart'; // För datumformatering
+import 'package:timezone/timezone.dart' as tz;
+import 'package:timezone/data/latest_all.dart' as tz_data;
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:uuid/uuid.dart';
 
-void main() {
+final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+    FlutterLocalNotificationsPlugin();
+
+final Uuid uuid = Uuid();
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await SupabaseConfig.initialize(); // Initialize Supabase
   runApp(Sticky());
+  tz_data.initializeTimeZones();
+  String title = 'Reminder'; // Define a title for the notification
+  String body =
+      'This is your scheduled notification.'; // Define the body content
+  DateTime scheduledDate =
+      DateTime.now().add(Duration(seconds: 10)); // Example scheduled date
+
+  await flutterLocalNotificationsPlugin.zonedSchedule(
+    DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    title,
+    body,
+    tz.TZDateTime.from(scheduledDate, tz.local),
+    const NotificationDetails(
+      android: AndroidNotificationDetails(
+        'note_channel',
+        'Note Reminders',
+        importance: Importance.max,
+        priority: Priority.high,
+      ),
+    ),
+    androidAllowWhileIdle: true,
+    uiLocalNotificationDateInterpretation:
+        UILocalNotificationDateInterpretation.absoluteTime,
+    matchDateTimeComponents: DateTimeComponents.dateAndTime,
+  );
 }
 
 class Sticky extends StatelessWidget {
@@ -59,22 +98,108 @@ class _NotesScreenState extends State<NotesScreen> {
             .toList();
         filteredNotes = List.from(notes);
       });
+      print('Notes loaded locally.');
     }
   }
 
   _saveNotes() async {
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user != null) {
+      // Save notes to Supabase
+      try {
+        final response = await Supabase.instance.client.from('notes').upsert(
+              notes
+                  .map((note) => {
+                        'user_id': user.id,
+                        'title': note['title'],
+                        'content': note['content'],
+                        'color': note['color'],
+                        'reminder_time': note['reminderTime'],
+                      })
+                  .toList(),
+            );
+
+        if (response != null && response is List) {
+          // Successfully synced notes
+          print('Notes synced to Supabase!');
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Notes synced to the database!')),
+          );
+        } else {
+          // Handle unexpected response
+          print('Unexpected response from Supabase: $response');
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Unexpected response from Supabase.')),
+          );
+        }
+      } catch (e) {
+        // Handle exceptions
+        print('Error syncing notes: $e');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error syncing notes: $e')),
+        );
+      }
+    } else {
+      print('User is not logged in. Saving notes locally.');
+      // Save notes locally
+      SharedPreferences prefs = await SharedPreferences.getInstance();
+      List<String> savedNotes = notes.map((note) => json.encode(note)).toList();
+      prefs.setStringList('notes', savedNotes);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Notes saved locally.')),
+      );
+    }
+  }
+
+  _saveNotesLocally() async {
     SharedPreferences prefs = await SharedPreferences.getInstance();
     List<String> savedNotes = notes.map((note) => json.encode(note)).toList();
     prefs.setStringList('notes', savedNotes);
+    print('Notes saved locally.');
   }
 
-  _addNote() async {
+  Future<void> _scheduleNotification(
+      String title, String body, DateTime scheduledTime, int noteIndex) async {
+    if (scheduledTime.isBefore(DateTime.now())) return; // Avoid past times
+
+    await flutterLocalNotificationsPlugin.zonedSchedule(
+      noteIndex, // Unique ID for the notification
+      title,
+      body,
+      tz.TZDateTime.from(scheduledTime, tz.local),
+      const NotificationDetails(
+        android: AndroidNotificationDetails(
+          'note_channel',
+          'Note Reminders',
+          channelDescription: 'Reminders for notes',
+          importance: Importance.max,
+          priority: Priority.high,
+          icon: '@mipmap/ic_launcher',
+        ),
+      ),
+      androidAllowWhileIdle: true,
+      uiLocalNotificationDateInterpretation:
+          UILocalNotificationDateInterpretation.absoluteTime,
+      matchDateTimeComponents: DateTimeComponents.dateAndTime,
+    );
+
+    // Schedule a callback to turn the note grey after the notification
+    Future.delayed(scheduledTime.difference(DateTime.now()), () {
+      setState(() {
+        notes[noteIndex]['color'] = Colors.grey.value; // Change to grey
+        _saveNotes();
+      });
+    });
+  }
+
+  Future<void> _addNote() async {
     Map<String, dynamic>? newNote = await showDialog(
       context: context,
       builder: (BuildContext context) {
         TextEditingController titleController = TextEditingController();
         TextEditingController contentController = TextEditingController();
         Color selectedColor = Colors.teal;
+        DateTime? reminderTime;
 
         return StatefulBuilder(
           builder: (context, setState) {
@@ -90,92 +215,147 @@ class _NotesScreenState extends State<NotesScreen> {
                   color: Colors.teal,
                 ),
               ),
-              content: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: <Widget>[
-                  SizedBox(height: 10),
-                  TextField(
-                    controller: titleController,
-                    decoration: InputDecoration(
-                      hintText: "Title",
-                      filled: true,
-                      fillColor: Colors.grey[100],
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide.none,
+              content: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    SizedBox(height: 10),
+                    TextField(
+                      controller: titleController,
+                      decoration: InputDecoration(
+                        hintText: "Title",
+                        filled: true,
+                        fillColor: Colors.grey[100],
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide(color: Colors.teal),
+                        ),
+                        contentPadding:
+                            EdgeInsets.symmetric(vertical: 14, horizontal: 16),
                       ),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.teal),
-                      ),
-                      contentPadding:
-                          EdgeInsets.symmetric(vertical: 14, horizontal: 16),
                     ),
-                  ),
-                  SizedBox(height: 15),
-                  TextField(
-                    controller: contentController,
-                    decoration: InputDecoration(
-                      hintText: "Write your note here",
-                      filled: true,
-                      fillColor: Colors.grey[100],
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide.none,
+                    SizedBox(height: 15),
+                    TextField(
+                      controller: contentController,
+                      decoration: InputDecoration(
+                        hintText: "Edit your note here",
+                        filled: true,
+                        fillColor: Colors.grey[100],
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide(color: Colors.teal),
+                        ),
+                        contentPadding:
+                            EdgeInsets.symmetric(vertical: 14, horizontal: 16),
                       ),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.teal),
+                      maxLines: 4,
+                    ),
+                    SizedBox(height: 15),
+                    Text(
+                      'Choose color:',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 14,
                       ),
-                      contentPadding:
-                          EdgeInsets.symmetric(vertical: 14, horizontal: 16),
                     ),
-                    maxLines: 4,
-                  ),
-                  SizedBox(height: 15),
-                  Text(
-                    'Choose color:',
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      fontSize: 14,
+                    SizedBox(height: 10),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.start,
+                      children: [
+                        _colorOption(Colors.teal, selectedColor, () {
+                          setState(() {
+                            selectedColor = Colors.teal;
+                          });
+                        }),
+                        _colorOption(Colors.green, selectedColor, () {
+                          setState(() {
+                            selectedColor = Colors.green;
+                          });
+                        }),
+                        _colorOption(Colors.blue, selectedColor, () {
+                          setState(() {
+                            selectedColor = Colors.blue;
+                          });
+                        }),
+                        _colorOption(Colors.pink, selectedColor, () {
+                          setState(() {
+                            selectedColor = Colors.pink;
+                          });
+                        }),
+                      ],
                     ),
-                  ),
-                  SizedBox(height: 10),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.start,
-                    children: [
-                      _colorOption(Colors.teal, selectedColor, () {
-                        setState(() {
-                          selectedColor = Colors.teal;
-                        });
-                      }),
-                      _colorOption(Colors.green, selectedColor, () {
-                        setState(() {
-                          selectedColor = Colors.green;
-                        });
-                      }),
-                      _colorOption(Colors.blue, selectedColor, () {
-                        setState(() {
-                          selectedColor = Colors.blue;
-                        });
-                      }),
-                      _colorOption(Colors.pink, selectedColor, () {
-                        setState(() {
-                          selectedColor = Colors.pink;
-                        });
-                      }),
-                    ],
-                  ),
-                ],
+                    SizedBox(height: 20),
+                    Text(
+                      'Reminder:',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: reminderTime != null
+                              ? Text(
+                                  'Reminder set: ${DateFormat('yyyy-MM-dd – kk:mm').format(reminderTime!)}',
+                                  style: TextStyle(color: Colors.teal),
+                                )
+                              : Text(
+                                  'Set a reminder',
+                                  style: TextStyle(
+                                      color: Colors.grey[600], fontSize: 14),
+                                ),
+                        ),
+                        IconButton(
+                          icon: Icon(Icons.access_alarm, color: Colors.teal),
+                          onPressed: () async {
+                            DateTime? pickedDate = await showDatePicker(
+                              context: context,
+                              initialDate: reminderTime ?? DateTime.now(),
+                              firstDate: DateTime.now(),
+                              lastDate: DateTime(2100),
+                            );
+                            if (pickedDate != null) {
+                              TimeOfDay? pickedTime = await showTimePicker(
+                                context: context,
+                                initialTime: TimeOfDay.fromDateTime(
+                                    reminderTime ?? DateTime.now()),
+                              );
+                              if (pickedTime != null) {
+                                setState(() {
+                                  reminderTime = DateTime(
+                                    pickedDate.year,
+                                    pickedDate.month,
+                                    pickedDate.day,
+                                    pickedTime.hour,
+                                    pickedTime.minute,
+                                  );
+                                });
+                              }
+                            }
+                          },
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
               ),
               actions: <Widget>[
                 TextButton(
                   onPressed: () {
                     Navigator.of(context).pop({
+                      'id': uuid.v4(), // Generate a unique ID for the note
                       'title': titleController.text,
                       'content': contentController.text,
                       'color': selectedColor.value,
+                      'reminderTime': reminderTime?.toIso8601String(),
                     });
                   },
                   child: Text(
@@ -199,16 +379,71 @@ class _NotesScreenState extends State<NotesScreen> {
         notes.add(newNote);
         filteredNotes.add(newNote);
       });
-      _saveNotes();
+      _saveNotesLocally(); // Save notes locally
     }
   }
 
-  _deleteNote(int index) {
-    setState(() {
-      notes.removeAt(index);
-      filteredNotes.removeAt(index);
-    });
-    _saveNotes();
+  Widget _colorOption(Color color, Color selectedColor, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        margin: EdgeInsets.only(right: 10),
+        width: 28,
+        height: 28,
+        decoration: BoxDecoration(
+          color: color,
+          shape: BoxShape.circle,
+          border: Border.all(
+            color: selectedColor == color ? Colors.black : Colors.transparent,
+            width: 2,
+          ),
+        ),
+      ),
+    );
+  }
+
+  _deleteNote(int index) async {
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user != null) {
+      try {
+        final noteId =
+            notes[index]['id']; // Assuming each note has a unique 'id'
+        final response = await Supabase.instance.client
+            .from('notes')
+            .delete()
+            .eq('id', noteId)
+            .eq('user_id',
+                user.id) // Ensure the note belongs to the logged-in user
+            .select(); // Ensure the response contains the deleted note(s)
+
+        if (response != null && response.isNotEmpty) {
+          setState(() {
+            notes.removeAt(index);
+            filteredNotes.removeAt(index);
+          });
+          print('Note deleted successfully!');
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Note deleted successfully!')),
+          );
+        } else {
+          print('Error deleting note: Response is null or empty');
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+                content:
+                    Text('Error deleting note: Response is null or empty')),
+          );
+        }
+      } catch (e) {
+        print('Error deleting note: $e');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error deleting note: $e')),
+        );
+      }
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('You must be logged in to delete notes.')),
+      );
+    }
   }
 
   _editNote(int index) async {
@@ -220,6 +455,9 @@ class _NotesScreenState extends State<NotesScreen> {
         TextEditingController contentController =
             TextEditingController(text: notes[index]['content']);
         Color selectedColor = Color(notes[index]['color']);
+        DateTime? reminderTime = notes[index]['reminderTime'] != null
+            ? DateTime.tryParse(notes[index]['reminderTime'])
+            : null;
 
         return StatefulBuilder(
           builder: (context, setState) {
@@ -235,84 +473,139 @@ class _NotesScreenState extends State<NotesScreen> {
                   color: Colors.teal,
                 ),
               ),
-              content: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: <Widget>[
-                  SizedBox(height: 10),
-                  TextField(
-                    controller: titleController,
-                    decoration: InputDecoration(
-                      hintText: "Title",
-                      filled: true,
-                      fillColor: Colors.grey[100],
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide.none,
+              content: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    SizedBox(height: 10),
+                    TextField(
+                      controller: titleController,
+                      decoration: InputDecoration(
+                        hintText: "Title",
+                        filled: true,
+                        fillColor: Colors.grey[100],
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide(color: Colors.teal),
+                        ),
+                        contentPadding:
+                            EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+                        prefixIcon: Icon(Icons.title, color: Colors.teal),
                       ),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.teal),
-                      ),
-                      contentPadding:
-                          EdgeInsets.symmetric(vertical: 14, horizontal: 16),
                     ),
-                  ),
-                  SizedBox(height: 15),
-                  TextField(
-                    controller: contentController,
-                    decoration: InputDecoration(
-                      hintText: "Edit your note here",
-                      filled: true,
-                      fillColor: Colors.grey[100],
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide.none,
+                    SizedBox(height: 15),
+                    TextField(
+                      controller: contentController,
+                      decoration: InputDecoration(
+                        hintText: "Edit your note here",
+                        filled: true,
+                        fillColor: Colors.grey[100],
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide(color: Colors.teal),
+                        ),
+                        contentPadding:
+                            EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+                        prefixIcon: Icon(Icons.edit, color: Colors.teal),
                       ),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.teal),
+                      maxLines: 4,
+                    ),
+                    SizedBox(height: 15),
+                    Text(
+                      'Choose color:',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 14,
                       ),
-                      contentPadding:
-                          EdgeInsets.symmetric(vertical: 14, horizontal: 16),
                     ),
-                    maxLines: 4,
-                  ),
-                  SizedBox(height: 15),
-                  Text(
-                    'Choose color:',
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      fontSize: 14,
+                    SizedBox(height: 10),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.start,
+                      children: [
+                        _colorOption(Colors.teal, selectedColor, () {
+                          setState(() {
+                            selectedColor = Colors.teal;
+                          });
+                        }),
+                        _colorOption(Colors.green, selectedColor, () {
+                          setState(() {
+                            selectedColor = Colors.green;
+                          });
+                        }),
+                        _colorOption(Colors.blue, selectedColor, () {
+                          setState(() {
+                            selectedColor = Colors.blue;
+                          });
+                        }),
+                        _colorOption(Colors.pink, selectedColor, () {
+                          setState(() {
+                            selectedColor = Colors.pink;
+                          });
+                        }),
+                      ],
                     ),
-                  ),
-                  SizedBox(height: 10),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.start,
-                    children: [
-                      _colorOption(Colors.teal, selectedColor, () {
-                        setState(() {
-                          selectedColor = Colors.teal;
-                        });
-                      }),
-                      _colorOption(Colors.green, selectedColor, () {
-                        setState(() {
-                          selectedColor = Colors.green;
-                        });
-                      }),
-                      _colorOption(Colors.blue, selectedColor, () {
-                        setState(() {
-                          selectedColor = Colors.blue;
-                        });
-                      }),
-                      _colorOption(Colors.pink, selectedColor, () {
-                        setState(() {
-                          selectedColor = Colors.pink;
-                        });
-                      }),
-                    ],
-                  ),
-                ],
+                    SizedBox(height: 20),
+                    Text(
+                      'Reminder:',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: reminderTime != null
+                              ? Text(
+                                  'Reminder set: ${DateFormat('yyyy-MM-dd – kk:mm').format(reminderTime!)}',
+                                  style: TextStyle(color: Colors.teal),
+                                )
+                              : Text(
+                                  'Set a reminder',
+                                  style: TextStyle(
+                                      color: Colors.grey[600], fontSize: 14),
+                                ),
+                        ),
+                        IconButton(
+                          icon: Icon(Icons.access_alarm, color: Colors.teal),
+                          onPressed: () async {
+                            DateTime? pickedDate = await showDatePicker(
+                              context: context,
+                              initialDate: reminderTime ?? DateTime.now(),
+                              firstDate: DateTime.now(),
+                              lastDate: DateTime(2100),
+                            );
+                            if (pickedDate != null) {
+                              TimeOfDay? pickedTime = await showTimePicker(
+                                context: context,
+                                initialTime: TimeOfDay.fromDateTime(
+                                    reminderTime ?? DateTime.now()),
+                              );
+                              if (pickedTime != null) {
+                                setState(() {
+                                  reminderTime = DateTime(
+                                    pickedDate.year,
+                                    pickedDate.month,
+                                    pickedDate.day,
+                                    pickedTime.hour,
+                                    pickedTime.minute,
+                                  );
+                                });
+                              }
+                            }
+                          },
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
               ),
               actions: <Widget>[
                 TextButton(
@@ -321,6 +614,7 @@ class _NotesScreenState extends State<NotesScreen> {
                       'title': titleController.text,
                       'content': contentController.text,
                       'color': selectedColor.value,
+                      'reminderTime': reminderTime?.toIso8601String(),
                     });
                   },
                   child: Text(
@@ -345,6 +639,16 @@ class _NotesScreenState extends State<NotesScreen> {
         filteredNotes[index] = editedNote;
       });
       _saveNotes();
+
+      // 🛎️ Schemalägg notis om tid sattes
+      if (editedNote['reminderTime'] != null) {
+        await _scheduleNotification(
+          editedNote['title'],
+          editedNote['content'],
+          DateTime.parse(editedNote['reminderTime']),
+          index,
+        );
+      }
     }
   }
 
@@ -362,10 +666,47 @@ class _NotesScreenState extends State<NotesScreen> {
     });
   }
 
-  _syncToDatabase() {
-    // Lägg här din kod för att spara noterna till en databas
-    print("Syncing notes to the database...");
-    // Du kan anropa en API eller en lokal databas här.
+  _syncToDatabase() async {
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user != null) {
+      try {
+        final response = await Supabase.instance.client.from('notes').upsert(
+              notes
+                  .map((note) => {
+                        'id': note['id'], // Ensure 'id' is included
+                        'user_id': user.id,
+                        'title': note['title'],
+                        'content': note['content'],
+                        'color': note['color'],
+                        'reminder_time': note['reminderTime'],
+                      })
+                  .toList(),
+            );
+
+        if (response != null && response is List) {
+          print('Notes synced to Supabase!');
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Notes synced to the database!')),
+          );
+        } else {
+          print('Error syncing notes: Response is null or unexpected');
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+                content: Text(
+                    'Error syncing notes: Response is null or unexpected')),
+          );
+        }
+      } catch (e) {
+        print('Error syncing notes: $e');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error syncing notes: $e')),
+        );
+      }
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('You must be logged in to sync notes.')),
+      );
+    }
   }
 
   @override
@@ -400,6 +741,12 @@ class _NotesScreenState extends State<NotesScreen> {
                 );
               },
             ),
+            IconButton(
+              icon: Icon(Icons.exit_to_app, color: Colors.white),
+              onPressed: () {
+                _showExitDialog();
+              },
+            ),
           ],
         ),
         body: Column(
@@ -420,9 +767,19 @@ class _NotesScreenState extends State<NotesScreen> {
                   itemCount: filteredNotes.length,
                   itemBuilder: (context, index) {
                     Color noteColor = Color(filteredNotes[index]['color']);
+                    DateTime? reminderTime =
+                        filteredNotes[index]['reminderTime'] != null
+                            ? DateTime.tryParse(
+                                filteredNotes[index]['reminderTime'])
+                            : null;
+                    String reminderText = reminderTime != null
+                        ? 'Reminder set for: ${reminderTime.toLocal()}'
+                            .split('.')[0]
+                        : 'No reminder set';
+
                     return GestureDetector(
                         onTap: () async {
-                          // Öppna redigeringsdialogen när man trycker på en anteckning
+                          // Open the edit dialog when tapping on a note
                           await _editNote(index);
                         },
                         child: Card(
@@ -445,13 +802,53 @@ class _NotesScreenState extends State<NotesScreen> {
                                     crossAxisAlignment:
                                         CrossAxisAlignment.start,
                                     children: [
-                                      Text(filteredNotes[index]['title'],
-                                          style: TextStyle(
-                                              fontWeight: FontWeight.bold,
-                                              fontSize: 18)),
+                                      Text(
+                                        filteredNotes[index]['title'],
+                                        style: TextStyle(
+                                            fontWeight: FontWeight.bold,
+                                            fontSize: 18),
+                                      ),
                                       SizedBox(height: 8),
-                                      Text(filteredNotes[index]['content'],
-                                          style: TextStyle(fontSize: 16)),
+                                      Text(
+                                        filteredNotes[index]['content'],
+                                        style: TextStyle(fontSize: 16),
+                                      ),
+                                      SizedBox(height: 8),
+                                      Row(
+                                        children: [
+                                          reminderTime != null
+                                              ? Icon(Icons.access_alarm,
+                                                  color: Colors.black)
+                                              : Stack(
+                                                  alignment: Alignment.center,
+                                                  children: [
+                                                    Text(
+                                                      'No reminder set',
+                                                      style: TextStyle(
+                                                          fontWeight:
+                                                              FontWeight.bold,
+                                                          fontSize: 12),
+                                                    ),
+                                                  ],
+                                                ),
+                                          SizedBox(width: 5),
+                                          Text(
+                                            reminderTime != null
+                                                ? DateFormat('yy-MM-dd – kk:mm')
+                                                    .format(reminderTime)
+                                                : '',
+                                            style: TextStyle(
+                                              color: reminderTime != null
+                                                  ? Colors.black
+                                                  : Colors.grey,
+                                              fontSize: 12,
+                                              decoration: reminderTime == null
+                                                  ? TextDecoration.lineThrough
+                                                  : TextDecoration.none,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
                                     ],
                                   ),
                                 ),
@@ -481,9 +878,8 @@ class _NotesScreenState extends State<NotesScreen> {
             } else if (index == 1) {
               _showUserDialog(context);
             } else if (index == 2) {
-              _syncToDatabase();
-            }
-            if (index == 3) {
+              _syncToDatabase(); // Sync notes
+            } else if (index == 3) {
               _showInstructions();
             }
           },
@@ -491,7 +887,7 @@ class _NotesScreenState extends State<NotesScreen> {
             BottomNavigationBarItem(
               icon: Icon(
                 FontAwesomeIcons.plus,
-                size: 30, // Större ikon för bättre användarupplevelse
+                size: 30,
               ),
               label: 'Add',
             ),
@@ -511,41 +907,18 @@ class _NotesScreenState extends State<NotesScreen> {
             ),
             BottomNavigationBarItem(
               icon: Icon(
-                Icons.help_outline, // Hjälpikon längst ner
+                Icons.help_outline,
                 size: 30,
               ),
               label: 'Help',
             ),
           ],
-          selectedItemColor: Colors.teal, // Färg för vald item
-          unselectedItemColor: Colors.grey, // Färg för icke-valda item
-          backgroundColor:
-              Colors.white, // Bakgrundsfärg för BottomNavigationBar
-          type: BottomNavigationBarType
-              .fixed, // Förhindrar att items ändrar sig när du skrollar
-          elevation: 5, // Lägger till en lätt skugga för en mer modern look
+          selectedItemColor: Colors.teal,
+          unselectedItemColor: Colors.grey,
+          backgroundColor: Colors.white,
+          type: BottomNavigationBarType.fixed,
+          elevation: 5,
         ));
-  }
-
-  Widget _colorOption(Color color, Color currentColor, Function onTap) {
-    return GestureDetector(
-      onTap: () {
-        onTap();
-      },
-      child: Container(
-        margin: EdgeInsets.only(right: 10),
-        width: 30,
-        height: 30,
-        decoration: BoxDecoration(
-          color: color,
-          shape: BoxShape.circle,
-          border: Border.all(
-            width: 2,
-            color: currentColor == color ? Colors.black : Colors.transparent,
-          ),
-        ),
-      ),
-    );
   }
 
   _showInstructions() {
@@ -591,12 +964,53 @@ class _NotesScreenState extends State<NotesScreen> {
       },
     );
   }
+
+  _showExitDialog() {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: Text('Exit App'),
+          content: Text('Do you want to sync your notes before exiting?'),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop(); // Close the dialog
+                _syncToDatabase(); // Sync notes
+                Future.delayed(Duration(milliseconds: 500), () {
+                  Navigator.of(context).pop(); // Exit the app
+                });
+              },
+              child: Text('Sync & Exit'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop(); // Close the dialog
+                Navigator.of(context).pop(); // Exit the app
+              },
+              child: Text('Exit Without Syncing'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop(); // Close the dialog
+              },
+              child: Text('Cancel'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+extension on PostgrestList {
+  get error => null;
+
+  Iterable? get data => null;
 }
 
 _showUserDialog(BuildContext context) async {
-  SharedPreferences prefs = await SharedPreferences.getInstance();
-  bool isLoggedIn = prefs.getBool('isLoggedIn') ?? false;
-  String userName = prefs.getString('username') ?? 'User';
+  final user = Supabase.instance.client.auth.currentUser;
 
   showDialog(
     context: context,
@@ -614,13 +1028,13 @@ _showUserDialog(BuildContext context) async {
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
               Icon(
-                isLoggedIn ? Icons.account_circle : Icons.login,
+                user != null ? Icons.account_circle : Icons.login,
                 size: 60,
-                color: isLoggedIn ? Colors.teal : Colors.grey,
+                color: user != null ? Colors.teal : Colors.grey,
               ),
               SizedBox(height: 10),
               Text(
-                isLoggedIn ? 'Welcome, $userName!' : 'Log in',
+                user != null ? 'Welcome, ${user.email}!' : 'Log in',
                 style: TextStyle(
                   fontSize: 22,
                   fontWeight: FontWeight.bold,
@@ -630,26 +1044,32 @@ _showUserDialog(BuildContext context) async {
               ),
               SizedBox(height: 10),
               Text(
-                isLoggedIn
-                    ? 'You are logged in as $userName.'
+                user != null
+                    ? 'You are logged in as ${user.email}.'
                     : 'To sync your notes, please log in first.',
                 style: TextStyle(fontSize: 16, color: Colors.black54),
                 textAlign: TextAlign.center,
               ),
               SizedBox(height: 20),
               ElevatedButton(
-                onPressed: () {
-                  if (isLoggedIn) {
-                    prefs.setBool('isLoggedIn', false);
+                onPressed: () async {
+                  if (user != null) {
+                    // Log out
+                    await Supabase.instance.client.auth.signOut();
                     Navigator.of(context).pop();
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Logged out successfully!')),
+                    );
                   } else {
+                    // Navigate to login page
                     Navigator.of(context).pop();
                     _navigateToLoginPage(context);
                   }
                 },
-                child: Text(isLoggedIn ? 'Log out' : 'Log in'),
+                child: Text(user != null ? 'Log out' : 'Log in'),
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: isLoggedIn ? Colors.redAccent : Colors.teal,
+                  backgroundColor:
+                      user != null ? Colors.redAccent : Colors.teal,
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(10),
                   ),
@@ -692,133 +1112,119 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
-  bool isLogin = true; // Håller reda på om vi är på login eller register
+  bool isLogin = true;
+  final TextEditingController emailController = TextEditingController();
+  final TextEditingController passwordController = TextEditingController();
+
+  Future<void> _handleAuth() async {
+    final email = emailController.text.trim();
+    final password = passwordController.text.trim();
+
+    try {
+      if (isLogin) {
+        // Login
+        await Supabase.instance.client.auth.signInWithPassword(
+          email: email,
+          password: password,
+        );
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Logged in successfully!')),
+        );
+      } else {
+        // Register
+        await Supabase.instance.client.auth.signUp(
+          email: email,
+          password: password,
+        );
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Account created successfully!')),
+        );
+      }
+      widget.onClose(); // Close the dialog
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: ${e.toString()}')),
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor:
-          Colors.black.withOpacity(0.5), // Halvtransparent bakgrund
+      backgroundColor: Colors.black.withOpacity(0.5),
       body: Center(
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 30),
-          child: AnimatedSwitcher(
-            duration: Duration(milliseconds: 500),
-            transitionBuilder: (child, animation) {
-              return ScaleTransition(scale: animation, child: child);
-            },
-            child: isLogin ? _buildLogin() : _buildRegister(),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildLogin() {
-    return _buildAuthForm(
-      title: "Login",
-      buttonText: "Login",
-      bottomText: "Don't have an account? Register",
-      onButtonPressed: () {
-        // Hantera login
-      },
-      onBottomTextPressed: () {
-        setState(() {
-          isLogin = false;
-        });
-      },
-    );
-  }
-
-  Widget _buildRegister() {
-    return _buildAuthForm(
-      title: "Register",
-      buttonText: "Sign Up",
-      bottomText: "Already have an account? Login",
-      onButtonPressed: () {
-        // Hantera register
-      },
-      onBottomTextPressed: () {
-        setState(() {
-          isLogin = true;
-        });
-      },
-    );
-  }
-
-  Widget _buildAuthForm({
-    required String title,
-    required String buttonText,
-    required String bottomText,
-    required VoidCallback onButtonPressed,
-    required VoidCallback onBottomTextPressed,
-  }) {
-    return Card(
-      key: ValueKey(title),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
-      elevation: 5,
-      color: Colors.white,
-      child: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  title,
-                  style: TextStyle(
-                    fontSize: 22,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.teal,
+          child: Card(
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+            elevation: 5,
+            color: Colors.white,
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    isLogin ? 'Login' : 'Register',
+                    style: TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.teal),
                   ),
-                ),
-                IconButton(
-                  icon: Icon(Icons.close, color: Colors.grey),
-                  onPressed: widget.onClose, // Stänger login/register
-                ),
-              ],
-            ),
-            SizedBox(height: 10),
-            TextField(
-              decoration: InputDecoration(
-                labelText: 'Email',
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.email, color: Colors.teal),
+                  SizedBox(height: 10),
+                  TextField(
+                    controller: emailController,
+                    decoration: InputDecoration(
+                      labelText: 'Email',
+                      border: OutlineInputBorder(),
+                      prefixIcon: Icon(Icons.email, color: Colors.teal),
+                    ),
+                  ),
+                  SizedBox(height: 10),
+                  TextField(
+                    controller: passwordController,
+                    decoration: InputDecoration(
+                      labelText: 'Password',
+                      border: OutlineInputBorder(),
+                      prefixIcon: Icon(Icons.lock, color: Colors.teal),
+                    ),
+                    obscureText: true,
+                  ),
+                  SizedBox(height: 20),
+                  ElevatedButton(
+                    onPressed: _handleAuth,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.teal,
+                      padding:
+                          EdgeInsets.symmetric(horizontal: 40, vertical: 15),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                    child: Text(
+                      isLogin ? 'Login' : 'Sign Up',
+                      style: TextStyle(fontSize: 16, color: Colors.white),
+                    ),
+                  ),
+                  SizedBox(height: 10),
+                  TextButton(
+                    onPressed: () {
+                      setState(() {
+                        isLogin = !isLogin;
+                      });
+                    },
+                    child: Text(
+                      isLogin
+                          ? "Don't have an account? Register"
+                          : "Already have an account? Login",
+                      style: TextStyle(color: Colors.teal),
+                    ),
+                  ),
+                ],
               ),
             ),
-            SizedBox(height: 10),
-            TextField(
-              decoration: InputDecoration(
-                labelText: 'Password',
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.lock, color: Colors.teal),
-              ),
-              obscureText: true,
-            ),
-            SizedBox(height: 20),
-            ElevatedButton(
-              onPressed: onButtonPressed,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.teal,
-                padding: EdgeInsets.symmetric(horizontal: 40, vertical: 15),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(10),
-                ),
-              ),
-              child: Text(buttonText,
-                  style: TextStyle(fontSize: 16, color: Colors.white)),
-            ),
-            SizedBox(height: 10),
-            TextButton(
-              onPressed: onBottomTextPressed,
-              child: Text(
-                bottomText,
-                style: TextStyle(color: Colors.teal),
-              ),
-            ),
-          ],
+          ),
         ),
       ),
     );

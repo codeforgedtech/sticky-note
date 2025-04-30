@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "478915996112",
+    "project_id": "stickysave-5cbdb",
+    "storage_bucket": "stickysave-5cbdb.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:478915996112:android:34dd085e4e308cb6d871d5",
+        "android_client_info": {
+          "package_name": "com.stickyNote"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAiJiRU49_yLb_WeZrAzT00PQsX04YexM0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

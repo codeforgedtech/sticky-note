@@ -26,16 +26,6 @@ class SettingsPage extends StatelessWidget {
               borderRadius: BorderRadius.circular(12),
             ),
             margin: EdgeInsets.symmetric(vertical: 8),
-            child: ListTile(
-              leading: Icon(Icons.palette, color: Colors.teal),
-              title:
-                  Text('Theme', style: TextStyle(fontWeight: FontWeight.bold)),
-              subtitle: Text('Change the app theme',
-                  style: TextStyle(color: Colors.black54)),
-              onTap: () {
-                // Implement theme selection here
-              },
-            ),
           ),
           Card(
             elevation: 4,
@@ -43,16 +33,6 @@ class SettingsPage extends StatelessWidget {
               borderRadius: BorderRadius.circular(12),
             ),
             margin: EdgeInsets.symmetric(vertical: 8),
-            child: ListTile(
-              leading: Icon(Icons.notifications, color: Colors.teal),
-              title: Text('Notifications',
-                  style: TextStyle(fontWeight: FontWeight.bold)),
-              subtitle: Text('Manage reminders and sounds',
-                  style: TextStyle(color: Colors.black54)),
-              onTap: () {
-                // Implement notification settings here
-              },
-            ),
           ),
           Card(
             elevation: 4,
